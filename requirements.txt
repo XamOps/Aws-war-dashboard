@@ -1,6 +1,0 @@
-boto3
-pandas
-tabulate
-python-dateutil
-matplotlib
-diagrams
