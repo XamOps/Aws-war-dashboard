@@ -1,86 +1,123 @@
-# backend/app.py
-import sys
-import os
-import json
-import time 
-import boto3 # Import boto3 here
-from datetime import datetime
-from flask import Flask
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+import boto3
+import time
+import traceback
 
-# Add the current directory to the Python path to find modules
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# Import all necessary functions
-from core.compliance import check_mfa
-from core.discovery import list_ec2_instances, list_s3_buckets
-from core.enhanced_discovery import get_rds_instance_status, check_secrets_rotation, get_ec2_rightsizing_recommendations, get_unattached_volumes
-from core.additional_checks import check_public_s3_buckets, check_unrestricted_security_groups, check_cloudtrail_status, check_ebs_backup_status, check_ec2_detailed_monitoring, check_s3_lifecycle_policies
-from core.advanced_checks import check_vpc_flow_logs, check_cloudformation_stack_drift, check_iam_access_key_age
-from cost.cloudwatch_analyzer import get_api_throttle_events
-
-def custom_serializer(obj):
-    if isinstance(obj, (datetime, datetime.date)):
-        return obj.isoformat()
-    raise TypeError(f"Type {type(obj)} not serializable")
+# Import your check modules
+from core import discovery, compliance, war_mapper, advanced_checks
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
-# --- FIX for CORS Error ---
-# This explicitly allows requests from your React frontend's origin for all routes under /api/.
-CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000"}})
+# In-memory cache to store scan results
+scan_cache = {}
+CACHE_TTL = 3600  # 1 hour
 
+def get_aws_session():
+    """Creates and returns a Boto3 session."""
+    return boto3.Session()
 
-@app.route("/")
-def index():
-    return "<h1>AWS Well-Architected Dashboard API</h1>"
+def run_pillar_checks(check_function, *args):
+    """Safely runs a check function and handles exceptions."""
+    try:
+        return check_function(*args)
+    except Exception as e:
+        print(f"Error running check {check_function.__name__}: {e}")
+        print(traceback.format_exc())
+        return {"error": f"Failed to run check: {check_function.__name__}", "details": str(e)}
 
-@app.route("/api/scan/all", methods=['GET'])
-def get_all_scans():
-    scan_start_time = time.time()
+@app.route('/api/scan/all', methods=['GET'])
+def get_all_findings():
+    """
+    Main endpoint to trigger a comprehensive scan of the AWS account.
+    It combines findings from all pillars with enhanced error handling.
+    """
+    cache_key = 'all_findings'
+    current_time = time.time()
+
+    if cache_key in scan_cache and (current_time - scan_cache[cache_key]['timestamp']) < CACHE_TTL:
+        print("Returning cached data for /api/scan/all")
+        return jsonify(scan_cache[cache_key]['data'])
+
+    print("No valid cache found, performing a new scan...")
+    start_time = time.time()
     
-    # Each function creates its own boto3 client and runs the scan
-    all_findings = {
-        "security": {
-            "users_without_mfa": check_mfa(),
-            "public_s3_buckets": check_public_s3_buckets(),
-            "unrestricted_security_groups": check_unrestricted_security_groups(),
-            "aged_iam_keys": check_iam_access_key_age(),
-            "cloudtrail_status": check_cloudtrail_status(),
-            "vpcs_without_flow_logs": check_vpc_flow_logs(),
-        },
-        "reliability": {
-            "rds_multi_az_status": get_rds_instance_status(),
-            "ebs_volumes_without_backup": check_ebs_backup_status(),
-        },
-        "cost_optimization": {
-            "s3_buckets_without_lifecycle": check_s3_lifecycle_policies(),
-            "compute_optimizer_status": get_ec2_rightsizing_recommendations(),
-            "unattached_volumes": get_unattached_volumes(),
-        },
-        "performance_efficiency": {
-            "ec2_without_detailed_monitoring": check_ec2_detailed_monitoring(),
-        },
-        "operational_excellence": {
-            "cloudformation_drift_status": check_cloudformation_stack_drift(),
+    try:
+        session = get_aws_session()
+        
+        # --- Basic Discovery (Run these first as they are dependencies) ---
+        iam_users = discovery.list_iam_users()
+        s3_buckets = discovery.list_s3_buckets()
+        ec2_instances = discovery.list_ec2_instances()
+        rds_instances = discovery.list_rds_instances()
+        vpcs = discovery.list_vpcs()
+        cloudtrails = discovery.list_cloudtrails()
+        security_groups = discovery.list_security_groups()
+        ebs_volumes = discovery.list_ebs_volumes()
+        cfn_stacks = discovery.list_cloudformation_stacks()
+
+        # --- Compliance and Pillar-Specific Checks (with individual error handling) ---
+        security_findings = {
+            "users_without_mfa": run_pillar_checks(compliance.check_mfa, iam_users),
+            "public_s3_buckets": run_pillar_checks(compliance.check_public_s3_buckets, s3_buckets, session),
+            "aged_iam_keys": run_pillar_checks(compliance.check_iam_key_age, iam_users, session),
+            "unrestricted_security_groups": run_pillar_checks(compliance.check_unrestricted_security_groups, security_groups),
+            "vpcs_without_flow_logs": run_pillar_checks(compliance.check_vpc_flow_logs, vpcs, session),
+            "cloudtrail_status": run_pillar_checks(compliance.check_cloudtrail_status, cloudtrails)
         }
-    }
-    
-    # --- FIX for TypeError ---
-    # Create a boto3 client and pass it to the function
-    cloudwatch_client = boto3.client('cloudwatch')
-    throttled_requests = get_api_throttle_events(cloudwatch_client)
-    
-    scan_end_time = time.time()
-    
-    all_findings["scan_metadata"] = {
-        "status": "Throttled" if throttled_requests > 0 else "Healthy",
-        "throttled_requests": throttled_requests,
-        "successful_requests": 14, 
-        "last_scan_duration_sec": round(scan_end_time - scan_start_time)
-    }
-    
-    return json.dumps(all_findings, default=custom_serializer), 200, {'Content-Type': 'application/json'}
+
+        cost_optimization_findings = {
+            "s3_buckets_without_lifecycle": run_pillar_checks(compliance.check_s3_lifecycle, s3_buckets, session),
+            "compute_optimizer_status": run_pillar_checks(compliance.check_compute_optimizer, session),
+            **run_pillar_checks(advanced_checks.run_all_advanced_checks, session).get('cost_optimization', {})
+        }
+        
+        reliability_findings = {
+            "rds_multi_az_status": run_pillar_checks(compliance.check_rds_multi_az, rds_instances),
+            "ebs_volumes_without_backup": run_pillar_checks(compliance.check_ebs_backups, ebs_volumes, session)
+        }
+        
+        performance_efficiency_findings = {
+             "ec2_without_detailed_monitoring": run_pillar_checks(compliance.check_ec2_detailed_monitoring, ec2_instances)
+        }
+
+        operational_excellence_findings = {
+            "cloudformation_drift_status": run_pillar_checks(compliance.check_cloudformation_drift, cfn_stacks, session)
+        }
+        
+        end_time = time.time()
+        scan_duration = round(end_time - start_time, 2)
+        print(f"Scan completed in {scan_duration} seconds.")
+
+        # --- Assemble Final Response ---
+        response_data = {
+            "scan_metadata": {
+                "status": "Healthy",
+                "last_scan_duration_sec": scan_duration,
+                "throttled_requests": 0
+            },
+            "security": security_findings,
+            "cost_optimization": cost_optimization_findings,
+            "reliability": reliability_findings,
+            "performance_efficiency": performance_efficiency_findings,
+            "operational_excellence": operational_excellence_findings
+        }
+        
+        # Cache the new results
+        scan_cache[cache_key] = {
+            'timestamp': current_time,
+            'data': response_data
+        }
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        print(f"A critical error occurred during the discovery phase: {e}")
+        print(traceback.format_exc())
+        return jsonify({"error": "Failed to complete the scan due to a critical error.", "details": str(e)}), 500
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(debug=True, port=5001)
+

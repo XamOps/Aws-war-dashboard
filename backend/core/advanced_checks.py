@@ -1,64 +1,134 @@
-# core/advanced_checks.py
 import boto3
-from datetime import datetime, timezone, timedelta
+from botocore.exceptions import ClientError
+from datetime import datetime, timedelta, timezone
 
-def check_vpc_flow_logs():
-    ec2 = boto3.client('ec2')
-    vpcs_without_flow_logs = []
-    try:
-        vpcs = ec2.describe_vpcs().get('Vpcs', [])
-        flow_logs = ec2.describe_flow_logs().get('FlowLogs', [])
-        vpcs_with_logs = {log['ResourceId'] for log in flow_logs}
-        
-        for vpc in vpcs:
-            if vpc['VpcId'] not in vpcs_with_logs:
-                vpcs_without_flow_logs.append(vpc['VpcId'])
-                
-    except Exception as e:
-        return {"error": f"Could not check VPC Flow Logs. Error: {e}"}
-    return vpcs_without_flow_logs
+def get_unattached_ebs_volumes(session):
+    """
+    Identifies and returns a list of unattached EBS volumes.
 
-def check_cloudformation_stack_drift():
-    cfn = boto3.client('cloudformation')
-    drifted_stacks = []
+    Args:
+        session: A Boto3 session object.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents an unattached EBS volume.
+    """
+    ec2 = session.client('ec2')
+    unattached_volumes = []
     try:
-        stacks = cfn.list_stacks(StackStatusFilter=[
-            'CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE'
-        ]).get('StackSummaries', [])
-        
-        for stack in stacks:
-            stack_name = stack['StackName']
-            try:
-                drift_detection_id = cfn.detect_stack_drift(StackName=stack_name)['StackDriftDetectionId']
-                waiter = cfn.get_waiter('stack_drift_detection_complete')
-                waiter.wait(StackDriftDetectionId=drift_detection_id)
-                result = cfn.describe_stack_drift_detection_status(StackDriftDetectionId=drift_detection_id)
-                if result['StackDriftStatus'] == 'DRIFTED':
-                    drifted_stacks.append({
-                        "StackName": stack_name, "DriftStatus": result['StackDriftStatus'],
-                        "DetectionStatusReason": result.get('DetectionStatusReason', '')
-                    })
-            except Exception:
+        # CORRECTED: 'Value' should be 'Values' and it should be a list.
+        volumes = ec2.describe_volumes(Filters=[{'Name': 'status', 'Values': ['available']}])
+        for volume in volumes.get('Volumes', []):
+            unattached_volumes.append({
+                'VolumeId': volume.get('VolumeId'),
+                'Size': volume.get('Size'),
+                'CreateTime': volume.get('CreateTime').isoformat() if volume.get('CreateTime') else None
+            })
+    except ClientError as e:
+        print(f"Error checking for unattached EBS volumes: {e}")
+    return unattached_volumes
+
+def get_idle_load_balancers(session):
+    """
+    Identifies and returns a list of idle Application and Network Load Balancers.
+    An ELB is considered idle if it has no registered instances/targets.
+
+    Args:
+        session: A Boto3 session object.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents an idle load balancer.
+    """
+    elbv2 = session.client('elbv2')
+    idle_lbs = []
+    try:
+        load_balancers = elbv2.describe_load_balancers().get('LoadBalancers', [])
+        for lb in load_balancers:
+            lb_arn = lb.get('LoadBalancerArn')
+            if not lb_arn:
                 continue
-    except Exception as e:
-        return {"error": f"Could not check CloudFormation drift. Error: {e}"}
-    return drifted_stacks
+                
+            target_groups = elbv2.describe_target_groups(LoadBalancerArn=lb_arn).get('TargetGroups', [])
+            if not target_groups:
+                 idle_lbs.append({
+                    'Name': lb.get('LoadBalancerName'),
+                    'Type': lb.get('Type'),
+                    'Reason': 'No target groups associated.'
+                })
+                 continue
+            
+            has_healthy_targets = False
+            for tg in target_groups:
+                tg_arn = tg.get('TargetGroupArn')
+                if not tg_arn:
+                    continue
+                health_descriptions = elbv2.describe_target_health(TargetGroupArn=tg_arn).get('TargetHealthDescriptions', [])
+                if any(target.get('TargetHealth', {}).get('State') == 'healthy' for target in health_descriptions):
+                    has_healthy_targets = True
+                    break
+            
+            if not has_healthy_targets:
+                 idle_lbs.append({
+                    'Name': lb.get('LoadBalancerName'),
+                    'Type': lb.get('Type'),
+                    'Reason': 'No healthy targets registered.'
+                })
 
-def check_iam_access_key_age():
-    iam = boto3.client('iam')
-    old_keys = []
-    ninety_days_ago = datetime.now(timezone.utc) - timedelta(days=90)
+    except ClientError as e:
+        print(f"Error checking for idle load balancers: {e}")
+    return idle_lbs
+
+def get_old_ebs_snapshots(session):
+    """
+    Identifies and returns a list of EBS snapshots older than one year.
+
+    Args:
+        session: A Boto3 session object.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents an old EBS snapshot.
+    """
+    ec2 = session.client('ec2')
+    sts = session.client('sts')
+    old_snapshots = []
+    one_year_ago = datetime.now(timezone.utc) - timedelta(days=365)
+    
     try:
-        users = iam.list_users().get('Users', [])
-        for user in users:
-            username = user['UserName']
-            keys = iam.list_access_keys(UserName=username).get('AccessKeyMetadata', [])
-            for key in keys:
-                if key['Status'] == 'Active' and key['CreateDate'] < ninety_days_ago:
-                    old_keys.append({
-                        "UserName": username, "AccessKeyId": key['AccessKeyId'],
-                        "CreateDate": key['CreateDate'].isoformat()
+        owner_id = sts.get_caller_identity().get('Account')
+        paginator = ec2.get_paginator('describe_snapshots')
+        
+        for page in paginator.paginate(OwnerIds=[owner_id]):
+            for snapshot in page.get('Snapshots', []):
+                if snapshot.get('StartTime') and snapshot.get('StartTime') < one_year_ago:
+                    old_snapshots.append({
+                        'SnapshotId': snapshot.get('SnapshotId'),
+                        'VolumeId': snapshot.get('VolumeId', 'N/A'),
+                        'StartTime': snapshot.get('StartTime').isoformat(),
+                        'VolumeSize': snapshot.get('VolumeSize', 'N/A')
                     })
-    except Exception as e:
-        return {"error": f"Could not check IAM key age. Error: {e}"}
-    return old_keys
+    except ClientError as e:
+        print(f"Error checking for old EBS snapshots: {e}")
+        if "AuthFailure" in str(e):
+            print("Could not check snapshots due to authentication failure. You may not be the owner.")
+        else:
+            # Don't raise, just return what we have
+            pass
+    return old_snapshots
+
+def run_all_advanced_checks(session):
+    """
+    Runs all advanced checks and aggregates the results.
+
+    Args:
+        session: A Boto3 session object.
+
+    Returns:
+        A dictionary containing the results of all advanced checks.
+    """
+    results = {
+        "cost_optimization": {
+            "unattached_ebs_volumes": get_unattached_ebs_volumes(session),
+            "idle_load_balancers": get_idle_load_balancers(session),
+            "old_ebs_snapshots": get_old_ebs_snapshots(session)
+        }
+    }
+    return results

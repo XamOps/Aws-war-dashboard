@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Shield, DollarSign, BarChart2, HardDrive, LogOut, AlertTriangle, CheckCircle, Bell, User, ChevronsRight, Zap, Layers, Activity, RefreshCw, UserX, Lock, Key, ShieldOff, FileText, WifiOff, Archive, Database, Disc, GaugeCircle, GitBranch } from 'lucide-react';
+import { Shield, DollarSign, BarChart2, HardDrive, LogOut, AlertTriangle, CheckCircle, Bell, User, ChevronsRight, Zap, Layers, Activity, RefreshCw, UserX, Lock, Key, ShieldOff, FileText, WifiOff, Archive, Database, Disc, GaugeCircle, GitBranch, Trash2, Network } from 'lucide-react';
 import { Radar, Doughnut } from 'react-chartjs-2';
 import { Chart as ChartJS, CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend, ArcElement, RadialLinearScale, PointElement, LineElement, Filler } from 'chart.js';
 
@@ -446,9 +446,49 @@ const CostPage = ({ data }) => (
                 </tr>
             )}
         />
+        <FindingTable 
+            icon={Disc}
+            title="Unattached EBS Volumes" 
+            columns={['Volume ID', 'Size (GiB)', 'Creation Date']} 
+            data={data?.unattached_ebs_volumes || []} 
+            renderRow={(item, index) => (
+                <tr key={item.VolumeId} className={`border-b transition-colors duration-200 ${index % 2 === 0 ? 'bg-gray-50' : 'bg-white'} hover:bg-yellow-100`}>
+                    <td className="px-6 py-4 font-mono">{item.VolumeId}</td>
+                    <td className="px-6 py-4">{item.Size}</td>
+                    <td className="px-6 py-4">{new Date(item.CreateTime).toLocaleDateString()}</td>
+                </tr>
+            )}
+        />
+        <FindingTable 
+            icon={Network}
+            title="Idle Load Balancers" 
+            columns={['Load Balancer Name', 'Type', 'Reason']} 
+            data={data?.idle_load_balancers || []} 
+            renderRow={(item, index) => (
+                <tr key={item.Name} className={`border-b transition-colors duration-200 ${index % 2 === 0 ? 'bg-gray-50' : 'bg-white'} hover:bg-yellow-100`}>
+                    <td className="px-6 py-4">{item.Name}</td>
+                    <td className="px-6 py-4"><span className="px-2 py-1 text-xs font-semibold text-gray-800 bg-gray-100 rounded-full">{item.Type}</span></td>
+                    <td className="px-6 py-4">{item.Reason}</td>
+                </tr>
+            )}
+        />
+         <FindingTable 
+            icon={Trash2}
+            title="Old EBS Snapshots (>1 year)" 
+            columns={['Snapshot ID', 'Volume ID', 'Creation Date']} 
+            data={data?.old_ebs_snapshots || []} 
+            renderRow={(item, index) => (
+                <tr key={item.SnapshotId} className={`border-b transition-colors duration-200 ${index % 2 === 0 ? 'bg-gray-50' : 'bg-white'} hover:bg-yellow-100`}>
+                    <td className="px-6 py-4 font-mono">{item.SnapshotId}</td>
+                    <td className="px-6 py-4 font-mono">{item.VolumeId}</td>
+                    <td className="px-6 py-4">{new Date(item.StartTime).toLocaleDateString()}</td>
+                </tr>
+            )}
+        />
         <ComputeOptimizerCard data={data?.compute_optimizer_status} />
     </div>
 );
+
 
 const ReliabilityPage = ({ data }) => (
     <div className="space-y-8">
